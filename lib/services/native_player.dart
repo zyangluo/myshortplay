@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 
 class NativePlayer {
@@ -8,15 +9,47 @@ class NativePlayer {
 
   static StreamSubscription? _globalEventSub;
   static final Map<int, NativePlayer> _instances = {};
+  static final Set<NativePlayer> _creating = {};
+  static final Map<int, Map<String, Map<Object?, Object?>>> _earlyEvents = {};
+  static const _creationTimeout = Duration(seconds: 15);
 
   static void _ensureGlobalListener() {
     if (_globalEventSub != null) return;
-    _globalEventSub = _events.receiveBroadcastStream().listen((event) {
-      if (event is! Map) return;
-      final playerId = event['playerId'] as int?;
-      if (playerId == null) return;
-      _instances[playerId]?._handleEvent(event);
-    });
+    _globalEventSub = _events.receiveBroadcastStream().listen(
+      (event) {
+        if (event is! Map) return;
+        final playerId = event['playerId'] as int?;
+        if (playerId == null) return;
+        final player = _instances[playerId];
+        if (player != null) {
+          player._handleEvent(event);
+        } else if (_creating.isNotEmpty &&
+            (_earlyEvents.containsKey(playerId) || _earlyEvents.length < 8)) {
+          final type = event['type'];
+          if (type is String) {
+            (_earlyEvents[playerId] ??= {})[type] = Map<Object?, Object?>.of(
+              event,
+            );
+          }
+        }
+      },
+      onError: (Object error) {
+        for (final player in _instances.values.toList()) {
+          player._handleEvent({
+            'type': 'error',
+            'value': '播放器事件通道异常：$error',
+          });
+        }
+      },
+    );
+  }
+
+  @visibleForTesting
+  static Future<void> resetEventListenerForTesting() async {
+    assert(_instances.isEmpty && _creating.isEmpty);
+    await _globalEventSub?.cancel();
+    _globalEventSub = null;
+    _earlyEvents.clear();
   }
 
   int? _playerId;
@@ -32,6 +65,7 @@ class NativePlayer {
   bool _completed = false;
   bool _buffering = false;
   bool _firstFrameRendered = false;
+  String? _errorMessage;
   int _videoWidth = 0;
   int _videoHeight = 0;
 
@@ -41,6 +75,7 @@ class NativePlayer {
   bool get completed => _completed;
   bool get buffering => _buffering;
   bool get firstFrameRendered => _firstFrameRendered;
+  String? get errorMessage => _errorMessage;
   int get videoWidth => _videoWidth;
   int get videoHeight => _videoHeight;
 
@@ -50,6 +85,7 @@ class NativePlayer {
   final _completedCtrl = StreamController<bool>.broadcast();
   final _bufferingCtrl = StreamController<bool>.broadcast();
   final _firstFrameCtrl = StreamController<bool>.broadcast();
+  final _errorCtrl = StreamController<String>.broadcast();
 
   Stream<Duration> get positionStream => _positionCtrl.stream;
   Stream<Duration> get durationStream => _durationCtrl.stream;
@@ -57,22 +93,70 @@ class NativePlayer {
   Stream<bool> get completedStream => _completedCtrl.stream;
   Stream<bool> get bufferingStream => _bufferingCtrl.stream;
   Stream<bool> get firstFrameStream => _firstFrameCtrl.stream;
+  Stream<String> get errorStream => _errorCtrl.stream;
 
   // ─── 生命周期 ──────────────────────────────────────────────────────────
 
   final _createdCompleter = Completer<int>();
 
   Future<int> create(String cdnUrl, String keyHex) async {
-    _ensureGlobalListener();
-    final result = await _channel.invokeMapMethod<String, dynamic>('create', {
-      'cdnUrl': cdnUrl,
-      'keyHex': keyHex,
+    if (_disposed) throw StateError('播放器已关闭');
+    final created = _createdCompleter.future;
+    unawaited(
+      created.then<void>((_) {}, onError: (Object _, StackTrace __) {}),
+    );
+    _creating.add(this);
+    try {
+      _ensureGlobalListener();
+      final result = await _channel.invokeMapMethod<String, dynamic>('create', {
+        'cdnUrl': cdnUrl,
+        'keyHex': keyHex,
+      });
+      final playerId = result?['playerId'];
+      if (playerId is! int) {
+        throw StateError('播放器未返回有效标识');
+      }
+      _playerId = playerId;
+      _instances[playerId] = this;
+      final events = _earlyEvents.remove(playerId);
+      if (events != null) {
+        for (final event in events.values) {
+          _handleEvent(event);
+        }
+      }
+      _textureId = await created.timeout(_creationTimeout);
+      return _textureId!;
+    } catch (_) {
+      await dispose();
+      rethrow;
+    } finally {
+      _creating.remove(this);
+      if (_creating.isEmpty) _earlyEvents.clear();
+    }
+  }
+
+  Future<void> waitForFirstFrame({
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    if (_errorMessage != null) throw StateError(_errorMessage!);
+    if (_disposed) throw StateError('播放器已关闭');
+    if (_firstFrameRendered) return;
+
+    final completer = Completer<void>();
+    final frameSubscription = firstFrameStream.listen((_) {
+      if (!completer.isCompleted) completer.complete();
     });
-    _playerId = result!['playerId'] as int;
-    _instances[_playerId!] = this;
-    // textureId 通过 EventChannel 异步推送
-    _textureId = await _createdCompleter.future;
-    return _textureId!;
+    final errorSubscription = errorStream.listen((message) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError(message));
+      }
+    });
+    try {
+      await completer.future.timeout(timeout);
+    } finally {
+      await frameSubscription.cancel();
+      await errorSubscription.cancel();
+    }
   }
 
   Future<void> play() async {
@@ -126,12 +210,14 @@ class NativePlayer {
     _completedCtrl.close();
     _bufferingCtrl.close();
     _firstFrameCtrl.close();
+    _errorCtrl.close();
   }
 
   // ─── 事件处理 ──────────────────────────────────────────────────────────
 
   void _handleEvent(dynamic event) {
     if (event is! Map) return;
+    if (_disposed) return;
     final type = event['type'] as String?;
     switch (type) {
       case 'created':
@@ -140,10 +226,11 @@ class NativePlayer {
           _createdCompleter.complete(textureId);
         }
       case 'error':
+        final message = event['value']?.toString() ?? '播放器发生未知错误';
+        _errorMessage = message;
+        _errorCtrl.add(message);
         if (!_createdCompleter.isCompleted) {
-          _createdCompleter.completeError(
-            Exception(event['value'] as String? ?? 'unknown error'),
-          );
+          _createdCompleter.completeError(Exception(message));
         }
       case 'position':
         if (_disposed) return;

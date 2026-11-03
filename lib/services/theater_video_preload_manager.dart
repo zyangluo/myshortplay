@@ -16,6 +16,7 @@ class TheaterVideoPreloadManager {
 
   final Map<String, String> _preloadedUrls = {};
   final Map<String, String> _sourceUrls = {};
+  final Map<String, DateTime> _preloadedExpiries = {};
   final Set<int> _preloadingEpisodeIndexes = {};
   final Set<String> _prewarmedVideoIds = {};
   final Set<String> _headerPrewarmedVideoIds = {};
@@ -24,6 +25,7 @@ class TheaterVideoPreloadManager {
   void clear() {
     _preloadedUrls.clear();
     _sourceUrls.clear();
+    _preloadedExpiries.clear();
     _preloadingEpisodeIndexes.clear();
     _prewarmedVideoIds.clear();
     _headerPrewarmedVideoIds.clear();
@@ -46,6 +48,9 @@ class TheaterVideoPreloadManager {
     _preloadedUrls.removeWhere(
       (videoId, _) => !retainedIds.contains(videoId),
     );
+    _preloadedExpiries.removeWhere(
+      (videoId, _) => !retainedIds.contains(videoId),
+    );
     _sourceUrls.removeWhere((videoId, _) => !retainedIds.contains(videoId));
     _prewarmedVideoIds.removeWhere(
       (videoId) => !retainedIds.contains(videoId),
@@ -62,7 +67,7 @@ class TheaterVideoPreloadManager {
     final nextIndex = currentIndex + 1;
     if (nextIndex >= episodes.length) return true;
     final videoId = episodes[nextIndex].url.trim();
-    return videoId.isNotEmpty && _preloadedUrls.containsKey(videoId);
+    return videoId.isNotEmpty && _cachedUrl(videoId) != null;
   }
 
   Future<String> resolvePlayUrl(
@@ -70,7 +75,7 @@ class TheaterVideoPreloadManager {
     required int episodeIndex,
     int maxRetries = 3,
   }) async {
-    final cachedUrl = _preloadedUrls[videoId];
+    final cachedUrl = _cachedUrl(videoId);
     if (cachedUrl != null) {
       debugPrint('使用预加载缓存，秒开');
       return cachedUrl;
@@ -78,12 +83,7 @@ class TheaterVideoPreloadManager {
 
     final resolved =
         await _resolveVideoWithRetry(videoId, maxRetries: maxRetries);
-    _preloadedUrls[videoId] = resolved.proxyUrl;
-    // putIfAbsent：保留第一次存入的 sourceUrl（来自 preloadEpisode /
-    // preloadEpisodeHeaderOnly），不让后续 resolvePlayUrl 覆盖它。
-    // native prewarm 缓存以 CDN URL 为 key，覆盖后 seedMdat 会用新 URL
-    // 而 prewarm 缓存里存的是旧 URL，导致 prewarmSeedMdat 返回非零。
-    _sourceUrls.putIfAbsent(videoId, () => resolved.sourceUrl);
+    _rememberResolved(videoId, resolved);
     debugPrint('播放地址就绪');
     return resolved.proxyUrl;
   }
@@ -99,7 +99,7 @@ class TheaterVideoPreloadManager {
     if (_preloadingEpisodeIndexes.contains(targetIndex)) return;
 
     final videoId = episodes[targetIndex].url.trim();
-    if (videoId.isEmpty || _preloadedUrls.containsKey(videoId)) return;
+    if (videoId.isEmpty || _cachedUrl(videoId) != null) return;
 
     _preloadingEpisodeIndexes.add(targetIndex);
     try {
@@ -107,12 +107,7 @@ class TheaterVideoPreloadManager {
       final resolved = await _resolveVideoWithRetry(videoId);
       if (!isStillCurrent()) return;
 
-      _preloadedUrls[videoId] = resolved.proxyUrl;
-      // putIfAbsent：保留第一次存入的 sourceUrl（来自 preloadEpisode /
-      // preloadEpisodeHeaderOnly），不让后续 resolvePlayUrl 覆盖它。
-      // native prewarm 缓存以 CDN URL 为 key，覆盖后 seedMdat 会用新 URL
-      // 而 prewarm 缓存里存的是旧 URL，导致 prewarmSeedMdat 返回非零。
-      _sourceUrls.putIfAbsent(videoId, () => resolved.sourceUrl);
+      _rememberResolved(videoId, resolved);
       // 串行预热，避免并发槽位满时直接丢掉预热任务。
       await _enqueuePrewarm(() async {
         if (!isStillCurrent() || _prewarmedVideoIds.contains(videoId)) return;
@@ -148,7 +143,7 @@ class TheaterVideoPreloadManager {
     if (_preloadingEpisodeIndexes.contains(targetIndex)) return;
 
     final videoId = episodes[targetIndex].url.trim();
-    if (videoId.isEmpty || _preloadedUrls.containsKey(videoId)) return;
+    if (videoId.isEmpty || _cachedUrl(videoId) != null) return;
 
     _preloadingEpisodeIndexes.add(targetIndex);
     try {
@@ -156,8 +151,7 @@ class TheaterVideoPreloadManager {
       final resolved = await _resolveVideoWithRetry(videoId);
       if (!isStillCurrent()) return;
 
-      _preloadedUrls[videoId] = resolved.proxyUrl;
-      _sourceUrls.putIfAbsent(videoId, () => resolved.sourceUrl);
+      _rememberResolved(videoId, resolved);
       await _enqueuePrewarm(() async {
         if (!isStillCurrent() ||
             _prewarmedVideoIds.contains(videoId) ||
@@ -215,6 +209,45 @@ class TheaterVideoPreloadManager {
     return queued;
   }
 
+  String? _cachedUrl(String videoId) {
+    final url = _preloadedUrls[videoId];
+    if (url == null) return null;
+    final expiresAt = _preloadedExpiries[videoId];
+    if (expiresAt != null &&
+        !DateTime.now()
+            .isBefore(expiresAt.subtract(const Duration(seconds: 30)))) {
+      _preloadedUrls.remove(videoId);
+      _preloadedExpiries.remove(videoId);
+      _sourceUrls.remove(videoId);
+      _prewarmedVideoIds.remove(videoId);
+      _headerPrewarmedVideoIds.remove(videoId);
+      return null;
+    }
+    return url;
+  }
+
+  void _rememberResolved(String videoId, _ResolvedTheaterVideo resolved) {
+    if (_sourceUrls[videoId] != resolved.sourceUrl) {
+      _prewarmedVideoIds.remove(videoId);
+      _headerPrewarmedVideoIds.remove(videoId);
+    }
+    _sourceUrls[videoId] = resolved.sourceUrl;
+    if (!resolved.cacheable) {
+      _preloadedUrls.remove(videoId);
+      _preloadedExpiries.remove(videoId);
+      _prewarmedVideoIds.remove(videoId);
+      _headerPrewarmedVideoIds.remove(videoId);
+      return;
+    }
+    _preloadedUrls[videoId] = resolved.proxyUrl;
+    final expiresAt = resolved.expiresAt;
+    if (expiresAt != null) {
+      _preloadedExpiries[videoId] = expiresAt;
+    } else {
+      _preloadedExpiries.remove(videoId);
+    }
+  }
+
   Future<_ResolvedTheaterVideo> _resolveVideoWithRetry(
     String videoId, {
     int maxRetries = 3,
@@ -245,14 +278,30 @@ class TheaterVideoPreloadManager {
       throw Exception('未获取到视频信息');
     }
 
-    final selected = _selectBestVideo(videoItems);
+    final selected = selectBestPlayableFqVideo(videoItems);
     debugPrint(
       '选择画质: ${selected.definition} ${selected.width}x${selected.height} codec=${selected.codec}',
     );
 
-    final key = await apiClient
-        .fetchDecryptKey(selected.spadeA)
-        .timeout(const Duration(seconds: 5));
+    final key = isValidFqDecryptKey(selected.decryptKey)
+        ? selected.decryptKey
+        : await apiClient
+            .fetchDecryptKey(selected.spadeA)
+            .timeout(const Duration(seconds: 5));
+    if (!isValidFqDecryptKey(key)) {
+      throw Exception('视频解密密钥格式无效');
+    }
+    final expiresAt = selected.expireTime == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(
+            selected.expireTime! < 10000000000
+                ? selected.expireTime! * 1000
+                : selected.expireTime!,
+          );
+    if (expiresAt != null &&
+        !expiresAt.isAfter(DateTime.now().add(const Duration(seconds: 30)))) {
+      throw Exception('视频地址已过期，请重新解析');
+    }
     debugPrint('获取key成功: ${key.substring(0, 8)}...');
 
     // Decrypt in the player IO pipeline via the native crypto:// protocol
@@ -263,16 +312,8 @@ class TheaterVideoPreloadManager {
       proxyUrl: playUrl,
       sourceUrl: selected.url,
       key: key,
-    );
-  }
-
-  FqVideoItem _selectBestVideo(List<FqVideoItem> items) {
-    return items.firstWhere(
-      (item) => item.definition == '1080p',
-      orElse: () => items.firstWhere(
-        (item) => item.definition == '720p',
-        orElse: () => items.last,
-      ),
+      expiresAt: expiresAt,
+      cacheable: selected.cacheable,
     );
   }
 }
@@ -282,9 +323,13 @@ class _ResolvedTheaterVideo {
     required this.proxyUrl,
     required this.sourceUrl,
     required this.key,
+    required this.expiresAt,
+    required this.cacheable,
   });
 
   final String proxyUrl;
   final String sourceUrl;
   final String key;
+  final DateTime? expiresAt;
+  final bool cacheable;
 }

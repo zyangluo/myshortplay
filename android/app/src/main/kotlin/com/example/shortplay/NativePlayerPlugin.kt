@@ -199,6 +199,11 @@ class NativePlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         var firstFrameSent = false
 
         player.addListener(object : Player.Listener {
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                val detail = error.message ?: error.errorCodeName
+                sendEvent(playerId, "error", "${error.errorCodeName}: $detail")
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_BUFFERING -> sendEvent(playerId, "buffering", true)

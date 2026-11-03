@@ -146,13 +146,9 @@ mixin PlayerPreloadMixin on State<PlayerPage> {
     unawaited(player.play());
 
     try {
-      if (!player.firstFrameRendered) {
-        await player.firstFrameStream
-            .firstWhere((v) => v)
-            .timeout(const Duration(seconds: 10));
-      }
-    } on TimeoutException {
-      debugPrint('[Player] prepareNext 超时');
+      await player.waitForFirstFrame(timeout: const Duration(seconds: 10));
+    } catch (error) {
+      debugPrint('[Player] prepareNext 等待首帧失败: $error');
       unawaited(player.dispose());
       return;
     }

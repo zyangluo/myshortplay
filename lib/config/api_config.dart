@@ -19,6 +19,7 @@ class ApiConfig {
   static const String fqUserAgent =
       'com.dragon.read/72132 (Linux; U; Android 13; zh_CN; Mi 10; Build/TKQ1.221114.001; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
   static const String fqAid = '1967';
+  static const String algorithmVideo = '/algorithm/video';
 
   // 超时配置
   static const Duration connectTimeout = Duration(seconds: 30);

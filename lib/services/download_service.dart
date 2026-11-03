@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/episode.dart';
+import '../models/fq_video.dart';
 import '../services/api_client.dart';
 import 'crypto_native_channel.dart';
 import 'video_save_service.dart';
@@ -381,18 +382,15 @@ class DownloadService extends ChangeNotifier {
           .timeout(const Duration(seconds: 10));
       if (videoItems.isEmpty) throw Exception('未获取到视频信息');
 
-      // 选最高画质
-      final selected = videoItems.firstWhere(
-        (item) => item.definition == '1080p',
-        orElse: () => videoItems.firstWhere(
-          (item) => item.definition == '720p',
-          orElse: () => videoItems.last,
-        ),
-      );
-
-      final keyHex = await apiClient
-          .fetchDecryptKey(selected.spadeA)
-          .timeout(const Duration(seconds: 5));
+      final selected = selectBestPlayableFqVideo(videoItems);
+      final keyHex = isValidFqDecryptKey(selected.decryptKey)
+          ? selected.decryptKey
+          : await apiClient
+              .fetchDecryptKey(selected.spadeA)
+              .timeout(const Duration(seconds: 5));
+      if (!isValidFqDecryptKey(keyHex)) {
+        throw Exception('视频解密密钥格式无效');
+      }
 
       return DownloadResolveResult(cdnUrl: selected.url, keyHex: keyHex);
     };

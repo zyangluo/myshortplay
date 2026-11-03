@@ -98,6 +98,7 @@ class _PlayerPageState extends State<PlayerPage>
   StreamSubscription<Duration>? _durationSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<bool>? _completedSub;
+  StreamSubscription<String>? _errorSub;
 
   @override
   List<Episode> get episodes => _episodes;
@@ -457,28 +458,22 @@ class _PlayerPageState extends State<PlayerPage>
       return;
     }
 
-    // 先 play，让 AVPlayer 开始缓冲和解码
-    unawaited(player.play());
-    unawaited(player.setRate(_isSpeedUp ? 2.0 : _playbackSpeed));
-    if (initialSeekMs != null && initialSeekMs > 0) {
-      unawaited(player.seek(Duration(milliseconds: initialSeekMs)));
-    }
-
-    // 等首帧渲染出来再隐藏 loading（避免黑屏闪烁）
+    // 先 play，让原生播放器开始缓冲和解码。
     try {
-      if (!player.firstFrameRendered) {
-        await player.firstFrameStream
-            .firstWhere((v) => v)
-            .timeout(const Duration(seconds: 15));
+      await player.play();
+      await player.setRate(_isSpeedUp ? 2.0 : _playbackSpeed);
+      if (initialSeekMs != null && initialSeekMs > 0) {
+        await player.seek(Duration(milliseconds: initialSeekMs));
       }
-    } on TimeoutException {
+      await player.waitForFirstFrame(timeout: const Duration(seconds: 15));
+    } catch (error) {
       if (!mounted || reqId != _requestId) {
         unawaited(player.dispose());
         return;
       }
       setState(() {
         _loading = false;
-        _errorMessage = '加载超时，请重试';
+        _errorMessage = error is TimeoutException ? '加载超时，请重试' : '播放失败: $error';
       });
       unawaited(player.dispose());
       return;
@@ -513,9 +508,14 @@ class _PlayerPageState extends State<PlayerPage>
     _playingSub = null;
     _completedSub?.cancel();
     _completedSub = null;
+    _errorSub?.cancel();
+    _errorSub = null;
   }
 
   void _setupSubscriptions(NativePlayer player, int reqId) {
+    _errorSub = player.errorStream.listen((message) {
+      _handlePlaybackError(player, reqId, message);
+    });
     _positionSub = player.positionStream.listen((pos) {
       if (reqId != _requestId) return;
       positionMsNotifier.value = pos.inMilliseconds;
@@ -532,6 +532,24 @@ class _PlayerPageState extends State<PlayerPage>
     _durationSub = player.durationStream.listen((dur) {
       if (reqId != _requestId) return;
       durationMsNotifier.value = dur.inMilliseconds;
+    });
+    final errorMessage = player.errorMessage;
+    if (errorMessage != null) {
+      _handlePlaybackError(player, reqId, errorMessage);
+    }
+  }
+
+  void _handlePlaybackError(NativePlayer player, int reqId, String message) {
+    if (!mounted || reqId != _requestId) return;
+    _cancelPlayerSubscriptions();
+    if (identical(_player, player)) {
+      _player = null;
+      _playerInitialized = false;
+      unawaited(player.dispose());
+    }
+    setState(() {
+      _loading = false;
+      _errorMessage = '播放失败: $message';
     });
   }
 

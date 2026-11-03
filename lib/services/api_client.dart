@@ -1,5 +1,5 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:dio/dio.dart';
 
@@ -34,6 +34,7 @@ class ApiClient {
 
   final Dio _dio;
   final Map<String, Drama> _dramaCache = {};
+  final Map<String, Future<List<FqVideoItem>>> _videoModelRequests = {};
 
   /// 暴露已配置 SignInterceptor 的 Dio，供 ShareLinkResolver 等复用同一签名链路。
   Dio get dio => _dio;
@@ -112,121 +113,88 @@ class ApiClient {
     return (dramas: dramas, hasMore: hasMore);
   }
 
-  /// 请求番茄官方API获取加密视频信息
-  Future<List<FqVideoItem>> fetchFqVideoModel(String videoId) async {
-    // iid / device_id 每次随机生成（番茄风控按设备维度限流，固定值易被封）。
-    // 同一组值同时用于签名请求与番茄请求，保证服务端签名的 URL 与实际请求逐字一致。
-    // 以下 9 个参数为实测的最小必需集：缺签名服务强制项(iid/device_id/aid/
-    // version_code/version_name/device_brand/os_version/cdid)会签名失败；
-    // 缺 device_platform 番茄返回空。其余参数实测可省。
-    final iid = _randomNumericId(19);
-    final deviceId = _randomNumericId(16);
-    final queryString = 'iid=$iid'
-        '&device_id=$deviceId'
-        '&aid=${ApiConfig.fqAid}'
-        '&version_code=72132'
-        '&version_name=7.2.1.32'
-        '&device_brand=Xiaomi'
-        '&os_version=13'
-        '&device_platform=android'
-        '&cdid=75e2081b-d8bf-4767-91e8-3424546b4d2e';
-    final fullUrl =
-        'https://${ApiConfig.fqVideoHost}${ApiConfig.fqVideoPath}?$queryString';
+  /// Resolve playable theater streams through the server and coalesce concurrent
+  /// lookups for the same episode.
+  Future<List<FqVideoItem>> fetchFqVideoModel(String videoId) {
+    final normalizedId = videoId.trim();
+    if (normalizedId.isEmpty) {
+      return Future.error(ApiException('视频ID为空'));
+    }
+    final pending = _videoModelRequests[normalizedId];
+    if (pending != null) return pending;
 
-    // 1. 获取算法签名
-    final signResponse = await _request(() => _dio.post(
-          '${ApiConfig.noveBaseUrl}${ApiConfig.algorithmSign}',
-          data: {'url': fullUrl},
+    final cancelToken = CancelToken();
+    final request =
+        _fetchTheaterVideoStreams(normalizedId, cancelToken).timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        cancelToken.cancel('视频解析超时');
+        throw TimeoutException('视频解析超时');
+      },
+    );
+    _videoModelRequests[normalizedId] = request;
+    return request.whenComplete(() {
+      if (identical(_videoModelRequests[normalizedId], request)) {
+        _videoModelRequests.remove(normalizedId);
+      }
+    });
+  }
+
+  Future<List<FqVideoItem>> _fetchTheaterVideoStreams(
+    String videoId,
+    CancelToken cancelToken,
+  ) async {
+    final response = await _request(() => _dio.post(
+          '${ApiConfig.noveBaseUrl}${ApiConfig.algorithmVideo}',
+          data: {'video_id': videoId},
+          cancelToken: cancelToken,
           options: Options(headers: {'Content-Type': 'application/json'}),
         ));
-    final signDecoded = _asJsonMap(signResponse.data);
-    if (signDecoded['code'] != 0) {
-      throw ApiException('算法签名失败');
+    final decoded = _asJsonMap(response.data);
+    if (_asInt(decoded['code']) != 0) {
+      throw ApiException(
+        decoded['message']?.toString() ??
+            decoded['msg']?.toString() ??
+            '解析短剧视频失败',
+      );
     }
-    final signData = signDecoded['data'] as Map<String, dynamic>? ?? {};
 
-    // 2. 请求番茄视频API
-    final fqHeaders = <String, String>{
-      'Host': ApiConfig.fqVideoHost,
-      'user-agent': ApiConfig.fqUserAgent,
-      'content-type': 'application/json; charset=utf-8',
-      'accept': 'application/json; charset=utf-8,application/x-protobuf',
-      'x-ss-dp': ApiConfig.fqAid,
-      'sdk-version': '2',
+    final data = _asJsonMap(decoded['data']);
+    var streams = data['streams'] ?? data['video_list'];
+    var posterUrl = data['poster_url']?.toString() ?? '';
+    if (streams == null && data['video_model'] != null) {
+      final rawModel = data['video_model'];
+      final model = rawModel is Map
+          ? rawModel.map((key, value) => MapEntry(key.toString(), value))
+          : _asJsonMap(jsonDecode(rawModel.toString()));
+      streams = model['video_list'];
+      posterUrl = model['poster_url']?.toString() ?? posterUrl;
+    }
+    if (streams is String) {
+      streams = jsonDecode(streams);
+    }
+
+    final entries = switch (streams) {
+      List values => values.whereType<Map>().map(_asJsonMap).toList(),
+      Map values => values.values.whereType<Map>().map(_asJsonMap).toList(),
+      _ => <Map<String, dynamic>>[],
     };
-    for (final key in signData.keys) {
-      fqHeaders[key] = signData[key].toString();
-    }
-
-    final body = {
-      'video_id': videoId,
-      'content_type': 1004,
-      'biz_param': {
-        'detail_page_version': 0,
-        'device_level': 3,
-        'disable_digg_stat': false,
-        'disable_video_relate_book': false,
-        'from_video_id': '',
-        'need_all_video_definition': true,
-        'need_mp4_align': false,
-        'source': 4,
-        'use_os_player': false,
-        'use_server_dns': false,
-        'video_platform': 3,
-      },
-    };
-
-    final fqResponse = await _request(() => _dio.post(
-          fullUrl,
-          data: body,
-          options: Options(headers: fqHeaders),
-        ));
-    final fqDecoded = _asJsonMap(fqResponse.data);
-    if (fqDecoded['code'] != 0) {
-      throw ApiException('获取视频信息失败: ${fqDecoded['message'] ?? ''}');
-    }
-
-    final data = fqDecoded['data'] as Map<String, dynamic>? ?? {};
-    final videoModelStr = data['video_model']?.toString() ?? '{}';
-    final videoModel = jsonDecode(videoModelStr) as Map<String, dynamic>;
-    final videoListRaw = videoModel['video_list'];
-    final posterUrl = videoModel['poster_url']?.toString() ?? '';
-
-    // video_list can be array or object depending on API version
-    List<Map<String, dynamic>> videoEntries;
-    if (videoListRaw is List) {
-      videoEntries = videoListRaw
-          .whereType<Map>()
-          .map((e) => e.cast<String, dynamic>())
-          .toList();
-    } else if (videoListRaw is Map) {
-      videoEntries = videoListRaw.values
-          .whereType<Map>()
-          .map((e) => e.cast<String, dynamic>())
-          .toList();
-    } else {
-      videoEntries = [];
-    }
-
-    final items = videoEntries
-        .map((item) => FqVideoItem.fromJson(item))
-        .where((v) => v.url.isNotEmpty && v.spadeA.isNotEmpty)
+    final items = entries
+        .map(FqVideoItem.fromJson)
+        .where(
+          (video) =>
+              video.url.isNotEmpty &&
+              (isValidFqDecryptKey(video.decryptKey) ||
+                  video.spadeA.isNotEmpty),
+        )
         .toList();
-
     for (final item in items) {
       item.posterUrl = posterUrl;
     }
-    return items;
-  }
-
-  /// 生成 [length] 位随机数字字符串，首位非 0（用于 iid / device_id）。
-  static final Random _idRandom = Random();
-  String _randomNumericId(int length) {
-    final buffer = StringBuffer()..write(1 + _idRandom.nextInt(9));
-    for (var i = 1; i < length; i++) {
-      buffer.write(_idRandom.nextInt(10));
+    if (items.isEmpty) {
+      throw ApiException('解析结果中没有可播放的视频流');
     }
-    return buffer.toString();
+    return items;
   }
 
   /// 请求服务端解密spade_a获取AES key
@@ -237,12 +205,12 @@ class ApiClient {
           options: Options(headers: {'Content-Type': 'application/json'}),
         ));
     final decoded = _asJsonMap(response.data);
-    if (decoded['code'] != 0) {
+    if (_asInt(decoded['code']) != 0) {
       throw ApiException('解密key失败');
     }
-    final data = decoded['data'] as Map<String, dynamic>? ?? {};
-    final key = data['key']?.toString() ?? '';
-    if (key.isEmpty || key.length != 32) {
+    final data = _asJsonMap(decoded['data']);
+    final key = data['key']?.toString().trim() ?? '';
+    if (!isValidFqDecryptKey(key)) {
       throw ApiException('无效的解密key');
     }
     return key;
@@ -285,7 +253,7 @@ class ApiClient {
     );
     final response = await _request(() => _dio.getUri(uri));
     final decoded = _decode(response);
-    final data = decoded['data'] as Map<String, dynamic>? ?? {};
+    final data = _asJsonMap(decoded['data']);
     final lists = data['lists'] as List? ?? [];
     final chapters = lists.whereType<Map>().map((item) {
       final itemId = item['item_id']?.toString() ?? '';
@@ -387,7 +355,7 @@ class ApiClient {
     }
     try {
       final decoded = _asJsonMap(response.data);
-      final code = decoded['code'] as int? ?? 0;
+      final code = decoded['code'] == null ? 0 : _asInt(decoded['code']);
       if (code != 0) {
         throw ApiException(decoded['msg']?.toString() ?? '接口异常', code: code);
       }
@@ -420,11 +388,23 @@ class ApiClient {
 
   Map<String, dynamic> _asJsonMap(Object? data) {
     if (data is Map<String, dynamic>) return data;
+    if (data is Map) {
+      return data.map((key, value) => MapEntry(key.toString(), value));
+    }
     if (data is String) {
       final decoded = jsonDecode(data);
       if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) {
+        return decoded.map((key, value) => MapEntry(key.toString(), value));
+      }
     }
     throw ApiException('解析接口返回失败');
+  }
+
+  int _asInt(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '') ?? -1;
   }
 }
 
